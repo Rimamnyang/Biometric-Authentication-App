@@ -1,199 +1,195 @@
+// FingerprintPortal.tsx
+// Replaces ws://localhost:5000 with:
+//  - /api/device/command  (to send VERIFY_FINGERPRINT)
+//  - Firestore onSnapshot on deviceEvents (to receive results)
+//  - Firestore onSnapshot on devices/{id} (for GPS status)
+
 import React, { useState, useEffect, useRef } from "react";
 import { db } from "../services/firebase";
-import {
-  collection,
-  query,
-  where,
-  getDocs,
-} from "firebase/firestore";
+import { collection, query, where, getDocs } from "firebase/firestore";
+import { doc, onSnapshot, updateDoc } from "firebase/firestore";
 import { Course, AccessCardData } from "../types";
 import AttendanceCard from "./AttendanceCard";
 import StatusModal from "./StatusModal";
-import { CheckCircle, XCircle, Fingerprint, Loader, Satellite, Wifi } from "lucide-react";
+import { CheckCircle, XCircle, Fingerprint, Loader, Satellite } from "lucide-react";
+import { requestFingerprintVerification } from "../services/deviceApi";
+
+const DEVICE_ID = import.meta.env.VITE_DEVICE_ID ?? "attendance-device-01";
+const ONLINE_THRESHOLD_MS = 60_000;
 
 export default function FingerprintPortal() {
-  const [scanState, setScanState] = useState<
-    "idle" | "scanning" | "success" | "error"
-  >("idle");
-  const [statusMessage, setStatusMessage] = useState("Initializing...");
+  const [scanState, setScanState] = useState<"idle" | "scanning" | "success" | "error">("idle");
+  const [statusMessage, setStatusMessage] = useState("Connecting...");
   const [gpsStatus, setGpsStatus] = useState<"searching" | "ready" | "offline">("offline");
   const [cardData, setCardData] = useState<AccessCardData | null>(null);
-  
-  // New state for Error/Status Modal
   const [statusModal, setStatusModal] = useState<{
     isOpen: boolean;
-    type: 'error' | 'warning' | 'info';
+    type: "error" | "warning" | "info";
     title: string;
     message: string;
-  }>({ isOpen: false, type: 'info', title: '', message: '' });
+  }>({ isOpen: false, type: "info", title: "", message: "" });
 
-  const ws = useRef<WebSocket | null>(null);
-  const hasNotifiedReady = useRef(false);
+  const processedEventIds = useRef<Set<string>>(new Set());
 
+  // ── Listen to device document for GPS/online status ───────────────────────
   useEffect(() => {
-    // Connect to the bridge server
-    ws.current = new WebSocket("ws://localhost:5000");
-    let isMounted = true;
-
-    ws.current.onopen = () => {
-      if (isMounted) {
-          console.log("Portal connected to bridge.");
-          setStatusMessage("Syncing Satellite Data...");
-          setGpsStatus("searching");
+    const deviceRef = doc(db, "devices", DEVICE_ID);
+    const unsub = onSnapshot(deviceRef, (snap) => {
+      if (!snap.exists()) {
+        setGpsStatus("offline");
+        setStatusMessage("Device offline");
+        return;
       }
-    };
+      const data = snap.data();
+      const lastSeen: string | null = data?.lastSeen ?? null;
+      const online = lastSeen
+        ? Date.now() - new Date(lastSeen).getTime() < ONLINE_THRESHOLD_MS
+        : false;
 
-    ws.current.onmessage = (event) => {
-      if (!isMounted) return;
+      if (!online) {
+        setGpsStatus("offline");
+        setStatusMessage("Device offline");
+        return;
+      }
 
-      let messageStr = event.data.toString();
-      let status = "", data: any = "";
-      
-      try {
-        const jsonData = JSON.parse(messageStr);
-        
-        // Handle GPS/Status Updates
-        if (jsonData.type === "ESP32_STATUS") {
-             const d = jsonData.data;
-             const hasFix = d.gpsFixed === true && d.satellites > 0;
-             if (hasFix) {
-                 if (gpsStatus !== "ready") {
-                     setGpsStatus("ready");
-                     setStatusMessage("Ready to authenticate");
-                     if (!hasNotifiedReady.current) {
-                         hasNotifiedReady.current = true;
-                     }
-                 }
-             } else {
-                 if (gpsStatus !== "searching") {
-                     setGpsStatus("searching");
-                     setStatusMessage("Syncing Satellite Data...");
-                 }
-             }
-             return;
-        }
+      const esp32 = data?.esp32Status ?? {};
+      const hasFix = esp32.gpsFixed === true && (esp32.satellites ?? 0) > 0;
+      if (hasFix) {
+        setGpsStatus("ready");
+        setStatusMessage("Ready to authenticate");
+      } else {
+        setGpsStatus("searching");
+        setStatusMessage("Syncing Satellite Data...");
+      }
+    });
+    return () => unsub();
+  }, []);
 
-        if (jsonData.type === "ATTENDANCE") {
+  // ── Listen for deviceEvents to handle scan results ────────────────────────
+  useEffect(() => {
+    const cutoff = new Date(Date.now() - 30_000).toISOString();
+    const q = query(
+      collection(db, "deviceEvents"),
+      where("deviceId", "==", DEVICE_ID),
+      where("processed", "==", false)
+    );
+
+    const unsub = onSnapshot(q, async (snapshot) => {
+      for (const change of snapshot.docChanges()) {
+        if (change.type !== "added" && change.type !== "modified") continue;
+        const eventDoc = change.doc;
+        const event = { id: eventDoc.id, ...eventDoc.data() } as any;
+
+        if (processedEventIds.current.has(event.id)) continue;
+        if (event.createdAt < cutoff) continue;
+        processedEventIds.current.add(event.id);
+
+        const p = event.payload ?? {};
+
+        switch (event.eventType) {
+          case "ATTENDANCE_RECORDED":
             setScanState("success");
             setStatusMessage("Signed In");
             setCardData({
-                name: jsonData.studentName || jsonData.data?.studentName || "Student",
-                studentId: jsonData.studentId || jsonData.data?.studentId || "N/A",
-                department: jsonData.department || jsonData.data?.department || "N/A",
-                courseName: jsonData.courseName || jsonData.data?.courseName || "Course",
-                attendancePercentage: jsonData.attendancePercentage || jsonData.data?.attendancePercentage || 0,
-                status: 'entry'
+              name: p.studentName ?? "Student",
+              studentId: p.studentId ?? "N/A",
+              department: p.department ?? "N/A",
+              courseName: p.courseName ?? "Course",
+              attendancePercentage: p.attendancePercentage ?? 0,
+              status: "entry",
             });
-            return;
-        } else if (jsonData.type === "DUPLICATE_ATTENDANCE") {
+            break;
+
+          case "SIGNED_OUT":
+            setScanState("success");
+            setStatusMessage(`${p.studentName}: Signed Out`);
+            setCardData({
+              name: p.studentName,
+              studentId: p.studentId,
+              department: p.department,
+              courseName: p.courseName,
+              attendancePercentage: p.attendancePercentage ?? 0,
+              status: "exit",
+            });
+            break;
+
+          case "DUPLICATE_ATTENDANCE":
             setStatusModal({
-                isOpen: true,
-                type: 'warning',
-                title: 'Already Marked',
-                message: `${jsonData.studentName}: Attendance has already been taken for this session.`
+              isOpen: true,
+              type: "warning",
+              title: "Already Marked",
+              message: `${p.studentName}: Attendance has already been taken for this session.`,
             });
             setScanState("idle");
-            return;
-        } else if (jsonData.type === "SIGNED_OUT") {
-            setScanState("success");
-            setStatusMessage(`${jsonData.studentName}: Signed Out`);
-            setCardData({
-                name: jsonData.studentName,
-                studentId: jsonData.studentId,
-                department: jsonData.department,
-                courseName: jsonData.courseName,
-                attendancePercentage: jsonData.attendancePercentage,
-                status: 'exit'
+            break;
+
+          case "SESSION_COMPLETED":
+            setStatusModal({
+              isOpen: true,
+              type: "info",
+              title: "Session Closed",
+              message: `${p.studentName}: You have already signed out of this session.`,
             });
-            return;
-        } else if (jsonData.type === "SESSION_COMPLETED") {
-             setStatusModal({
-                 isOpen: true,
-                 type: 'info',
-                 title: 'Session Closed',
-                 message: `${jsonData.studentName}: You have already signed out of this session.`
-             });
-             setScanState("idle");
-             return;
-        } else if (jsonData.type === "NO_ACTIVE_SESSION") {
-             setStatusModal({
-                 isOpen: true,
-                 type: 'error',
-                 title: 'No Session',
-                 message: `${jsonData.studentName}: There are no active sessions available right now.`
-             });
-             setScanState("idle");
-             return;
-        } else if (jsonData.type === "NO_MATCHING_SESSION") {
-             setStatusModal({
-                 isOpen: true,
-                 type: 'error',
-                 title: 'Wrong Session',
-                 message: `${jsonData.studentName}: No active session matches your Department (${jsonData.department}) and Level.`
-             });
-             setScanState("idle");
-             return;
-        } else if (jsonData.type === "ENROLL_RESPONSE") {
-            status = jsonData.success ? "SUCCESS" : "ERROR";
-            data = jsonData.error || jsonData.id || "Enrollment failed";
-        } else if (jsonData.type === "VERIFY_RESPONSE") {
-             if (jsonData.success) {
-                 setScanState("success");
-                 setStatusMessage("Fingerprint verified, processing...");
-                 return; 
-             } else {
-                 setStatusModal({
-                     isOpen: true,
-                     type: 'error',
-                     title: 'Not Recognized',
-                     message: 'Fingerprint did not match any student record.'
-                 });
-                 setScanState("error");
-                 setStatusMessage("Fingerprint not recognized");
-                 return;
-             }
-        } else {
-             status = jsonData.type || "UNKNOWN";
-        }
-      } catch (e) {
-        const parts = messageStr.split(":", 2);
-        status = parts[0];
-        data = parts[1];
-      }
+            setScanState("idle");
+            break;
 
-      if (status === "SUCCESS") {
-        // Legacy handling if needed
-      } else if (status === "STATUS") {
-        if (gpsStatus === "ready" && typeof data === 'string' && data.length < 50) {
-            setStatusMessage(data);
+          case "NO_ACTIVE_SESSION":
+            setStatusModal({
+              isOpen: true,
+              type: "error",
+              title: "No Session",
+              message: `${p.studentName}: There are no active sessions available right now.`,
+            });
+            setScanState("idle");
+            break;
+
+          case "NO_MATCHING_SESSION":
+            setStatusModal({
+              isOpen: true,
+              type: "error",
+              title: "Wrong Session",
+              message: `${p.studentName}: No active session matches your Department (${p.department}) and Level.`,
+            });
+            setScanState("idle");
+            break;
+
+          case "VERIFY_RESPONSE":
+            if (p.success === false) {
+              setStatusModal({
+                isOpen: true,
+                type: "error",
+                title: "Not Recognized",
+                message: "Fingerprint did not match any student record.",
+              });
+              setScanState("error");
+              setStatusMessage("Fingerprint not recognized");
+            }
+            break;
+
+          default:
+            break;
+        }
+
+        // Mark event as processed
+        try {
+          await updateDoc(doc(db, "deviceEvents", event.id), { processed: true });
+        } catch {
+          // Non-critical
         }
       }
-    };
+    });
 
-    ws.current.onerror = async () => {
-      if (isMounted) {
-        setScanState("error");
-        setGpsStatus("offline");
-        setStatusMessage("Bridge Offline");
-      }
-    };
+    return () => unsub();
+  }, []);
 
-    return () => {
-      isMounted = false;
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.close();
-      }
-    };
-  }, []); // Only run once on mount
-
+  // ── Auto-reset after error/success ───────────────────────────────────────
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
-    // Reset state after success or error (short delay)
     if (scanState === "error" || scanState === "success") {
       timer = setTimeout(() => {
         if (!cardData && !statusModal.isOpen) {
-            setScanState("idle");
-            setStatusMessage(gpsStatus === "ready" ? "Ready to authenticate" : "Syncing Satellite Data...");
+          setScanState("idle");
+          setStatusMessage(gpsStatus === "ready" ? "Ready to authenticate" : "Syncing Satellite Data...");
         }
       }, 4000);
     }
@@ -212,30 +208,35 @@ export default function FingerprintPortal() {
     return () => clearTimeout(timer);
   }, [cardData, gpsStatus]);
 
-  const handleStartVerification = () => {
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+  // ── Send verification command ─────────────────────────────────────────────
+  const handleStartVerification = async () => {
+    if (gpsStatus === "offline") {
       setStatusModal({
-          isOpen: true,
-          type: 'error',
-          title: 'Connection Error',
-          message: 'The system is not connected to the bridge server.'
+        isOpen: true,
+        type: "error",
+        title: "Device Offline",
+        message: "The biometric device is not connected. Please contact support.",
       });
       return;
     }
-    
     if (gpsStatus !== "ready") {
-        setStatusModal({
-            isOpen: true,
-            type: 'warning',
-            title: 'GPS Offline',
-            message: 'Waiting for satellite synchronization. Please wait for GPS Lock.'
-        });
-        return;
+      setStatusModal({
+        isOpen: true,
+        type: "warning",
+        title: "GPS Offline",
+        message: "Waiting for satellite synchronization. Please wait for GPS Lock.",
+      });
+      return;
     }
 
     setScanState("scanning");
-    setStatusMessage("Place your finger");
-    ws.current.send("VERIFY_FINGERPRINT");
+    setStatusMessage("Place your finger on the scanner...");
+
+    const result = await requestFingerprintVerification(DEVICE_ID);
+    if (!result.success) {
+      setScanState("error");
+      setStatusMessage("Failed to send command. Please try again.");
+    }
   };
 
   const handleCloseCard = () => {
@@ -245,13 +246,12 @@ export default function FingerprintPortal() {
   };
 
   return (
-    <div className="min-h-screen  bg-black-800  flex flex-col items-center justify-center p-6">
-      
+    <div className="min-h-screen bg-black-800 flex flex-col items-center justify-center p-6">
       {cardData && <AttendanceCard data={cardData} onClose={handleCloseCard} />}
-      
-      <StatusModal 
-        isOpen={statusModal.isOpen} 
-        onClose={() => setStatusModal(prev => ({ ...prev, isOpen: false }))}
+
+      <StatusModal
+        isOpen={statusModal.isOpen}
+        onClose={() => setStatusModal((prev) => ({ ...prev, isOpen: false }))}
         type={statusModal.type}
         title={statusModal.title}
         message={statusModal.message}
@@ -261,32 +261,38 @@ export default function FingerprintPortal() {
         {/* Header */}
         <div className="text-center mb-12 relative">
           <div className="absolute -top-4 right-0 flex gap-2">
-               {/* GPS Status Badge */}
-               <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all duration-300 shadow-md ${
-                   gpsStatus === "ready" ? "bg-green-500/20 text-green-300 border border-green-400/30 shadow-lg shadow-green-500/20" : 
-                   gpsStatus === "searching" ? "bg-blue-500/20 text-blue-300 border border-blue-400/30 animate-pulse" : 
-                   "bg-gray-500/20 text-gray-400 border border-gray-400/20"
-               }`}>
-                   <Satellite className={`w-3.5 h-3.5 ${
-                       gpsStatus === "ready" ? "" : gpsStatus === "searching" ? "animate-spin" : ""
-                   }`} />
-                   <span>{gpsStatus === "ready" ? "GPS LOCKED" : gpsStatus === "searching" ? "ACQUIRING..." : "OFFLINE"}</span>
-               </div>
+            <div
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all duration-300 shadow-md ${
+                gpsStatus === "ready"
+                  ? "bg-green-500/20 text-green-300 border border-green-400/30 shadow-lg shadow-green-500/20"
+                  : gpsStatus === "searching"
+                  ? "bg-blue-500/20 text-blue-300 border border-blue-400/30 animate-pulse"
+                  : "bg-gray-500/20 text-gray-400 border border-gray-400/20"
+              }`}
+            >
+              <Satellite
+                className={`w-3.5 h-3.5 ${
+                  gpsStatus === "searching" ? "animate-spin" : ""
+                }`}
+              />
+              <span>
+                {gpsStatus === "ready"
+                  ? "GPS LOCKED"
+                  : gpsStatus === "searching"
+                  ? "ACQUIRING..."
+                  : "OFFLINE"}
+              </span>
+            </div>
           </div>
-          <h1 className="text-3xl font-semibold text-gray-300 mb-2">
-            Biometric Login
-          </h1>
-          <p className="text-gray-500">
-            Authenticate using your fingerprint
-          </p>
+          <h1 className="text-3xl font-semibold text-gray-300 mb-2">Biometric Login</h1>
+          <p className="text-gray-500">Authenticate using your fingerprint</p>
         </div>
 
         {/* Main Card */}
-        <div className="bg-gray-800  rounded-3xl shadow-lg p-8">
-          {/* Icon Container */}
+        <div className="bg-gray-800 rounded-3xl shadow-lg p-8">
+          {/* Icon */}
           <div className="flex justify-center mb-8">
             <div className="relative">
-              {/* Animated glow effect */}
               <div
                 className={`absolute inset-0 rounded-full blur-2xl opacity-20 transition-all duration-500 ${
                   scanState === "scanning"
@@ -298,7 +304,6 @@ export default function FingerprintPortal() {
                     : "bg-transparent"
                 }`}
               />
-              {/* Icon circle */}
               <div
                 className={`relative w-32 h-32 rounded-full flex items-center justify-center transition-all duration-300 ${
                   scanState === "scanning"
@@ -310,18 +315,10 @@ export default function FingerprintPortal() {
                     : "bg-gray-50 border-2 border-gray-200"
                 }`}
               >
-                {scanState === "scanning" && (
-                  <Loader className="w-12 h-12 text-blue-600 animate-spin" />
-                )}
-                {scanState === "success" && (
-                  <CheckCircle className="w-12 h-12 text-green-600" />
-                )}
-                {scanState === "error" && (
-                  <XCircle className="w-12 h-12 text-red-600" />
-                )}
-                {scanState === "idle" && (
-                  <Fingerprint className="w-12 h-12 text-gray-400" />
-                )}
+                {scanState === "scanning" && <Loader className="w-12 h-12 text-blue-600 animate-spin" />}
+                {scanState === "success" && <CheckCircle className="w-12 h-12 text-green-600" />}
+                {scanState === "error" && <XCircle className="w-12 h-12 text-red-600" />}
+                {scanState === "idle" && <Fingerprint className="w-12 h-12 text-gray-400" />}
               </div>
             </div>
           </div>
@@ -344,11 +341,13 @@ export default function FingerprintPortal() {
               {statusMessage}
             </p>
             {gpsStatus === "searching" && (
-              <p className="text-xs text-gray-500 mt-2 animate-pulse">Waiting for satellite lock...</p>
+              <p className="text-xs text-gray-500 mt-2 animate-pulse">
+                Waiting for satellite lock...
+              </p>
             )}
           </div>
 
-          {/* Action Button */}
+          {/* Button */}
           <button
             onClick={handleStartVerification}
             disabled={scanState === "scanning" || gpsStatus !== "ready"}
@@ -361,16 +360,16 @@ export default function FingerprintPortal() {
             {scanState === "scanning"
               ? "Scanning..."
               : gpsStatus !== "ready"
-              ? "Waiting for GPS..."
+              ? gpsStatus === "offline"
+                ? "Device Offline"
+                : "Waiting for GPS..."
               : "Start Authentication"}
           </button>
         </div>
 
         {/* Footer */}
         <div className="text-center mt-8">
-          <p className="text-sm text-gray-400">
-            Secured by Dern Technology
-          </p>
+          <p className="text-sm text-gray-400">Secured by Dern Technology</p>
         </div>
       </div>
     </div>

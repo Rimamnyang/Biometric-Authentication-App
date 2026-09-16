@@ -1,0 +1,76 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // ── Admins ───────────────────────────────────────────────────────────────
+    // Only the admin's own document is readable by them.
+    match /admins/{uid} {
+      allow read: if isSignedIn() && request.auth.uid == uid;
+      allow write: if false; // managed via Firebase Console / Admin SDK only
+    }
+
+    // ── Students ─────────────────────────────────────────────────────────────
+    // Authenticated admins can read/write; public portals can read (for fingerprint lookup).
+    match /students/{studentId} {
+      allow read: if true;          // Portals need to resolve fingerprint → student
+      allow write: if isSignedIn(); // Admin only
+    }
+
+    // ── Courses ──────────────────────────────────────────────────────────────
+    match /courses/{courseId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // ── Course ↔ Student mapping ──────────────────────────────────────────────
+    match /courseStudents/{docId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // ── Sessions ─────────────────────────────────────────────────────────────
+    match /sessions/{sessionId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
+    // ── Attendance ───────────────────────────────────────────────────────────
+    // READS: authenticated admins and public portals (for exam percentage check).
+    // WRITES: blocked from browser — only the server-side API (Firebase Admin SDK)
+    //         may create or update attendance records.
+    match /attendance/{attendanceId} {
+      allow read: if true;
+      allow write: if false; // Server-only via Admin SDK in api/device/event.ts
+    }
+
+    // ── Device documents ─────────────────────────────────────────────────────
+    // Written by Admin SDK. Frontend reads for realtime status display.
+    match /devices/{deviceId} {
+      allow read: if true;  // ServerStatus and FingerprintPortal need this
+      allow write: if false; // Admin SDK only
+    }
+
+    // ── Device commands ──────────────────────────────────────────────────────
+    // Written by Admin SDK (api/device/command.ts). Read by Admin SDK (api/device/poll.ts).
+    // Frontend never needs direct access.
+    match /deviceCommands/{commandId} {
+      allow read, write: if false;
+    }
+
+    // ── Device events ─────────────────────────────────────────────────────────
+    // Written by Admin SDK. Browser reads + marks processed = true.
+    match /deviceEvents/{eventId} {
+      allow read: if true;  // Components listen for realtime events
+      // Allow browsers to mark events as processed (processed: true update only)
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['processed'])
+                    && request.resource.data.processed == true;
+      allow create, delete: if false; // Admin SDK only
+    }
+
+  }
+}

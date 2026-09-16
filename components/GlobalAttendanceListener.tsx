@@ -1,326 +1,167 @@
-import React, { useEffect, useRef } from "react";
+// GlobalAttendanceListener.tsx
+// Replaces the old WebSocket bridge listener.
+// Now listens to Firestore `deviceEvents` collection for real-time updates.
+// Attendance DB writes are performed server-side (api/device/event.ts).
+// This component is only responsible for UI feedback: toasts and attendance cards.
+
+import React, { useEffect, useRef, useState } from "react";
 import { db } from "../services/firebase";
-import { reverseGeocode } from "../services/geocoding";
 import {
   collection,
   query,
   where,
-  getDocs,
-  addDoc,
-  updateDoc,
-  Timestamp,
   onSnapshot,
+  orderBy,
+  limit,
+  updateDoc,
+  doc,
+  Timestamp,
 } from "firebase/firestore";
-import { Attendance } from "../types";
 
-// Global Lock Set (outside component to survive remounts)
-const globalPendingAttendance = new Set<string>();
+const DEVICE_ID = import.meta.env.VITE_DEVICE_ID ?? "attendance-device-01";
+
+// Lightweight toast shown globally when someone scans at the kiosk
+interface AttendanceToast {
+  id: string;
+  type: "entry" | "exit" | "error" | "warning" | "info";
+  title: string;
+  message: string;
+}
 
 export default function GlobalAttendanceListener() {
-  const ws = useRef<WebSocket | null>(null);
-  const lastKnownGPS = useRef<{ latitude: number | null; longitude: number | null }>({
-    latitude: null,
-    longitude: null,
-  });
-
-  // Data Caches
-  const [coursesCache, setCoursesCache] = React.useState<Map<string, any>>(new Map());
-  const [activeSessionsCache, setActiveSessionsCache] = React.useState<any[]>([]);
-  const coursesRef = useRef(new Map());
-  const sessionsRef = useRef<any[]>([]);
-
-  // Track last processed verification to prevent duplicates
-  const lastProcessedVerification = useRef<{
-    id: string | null;
-    timestamp: number;
-  }>({ id: null, timestamp: 0 });
-
-  // Sync refs with state for use in async functions
-  useEffect(() => {
-      coursesRef.current = coursesCache;
-  }, [coursesCache]);
+  const [toasts, setToasts] = useState<AttendanceToast[]>([]);
+  // Track which events we've already handled to avoid double-processing on remount
+  const processedIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-      sessionsRef.current = activeSessionsCache;
-  }, [activeSessionsCache]);
+    // Listen for recent, unprocessed deviceEvents
+    const cutoff = new Date(Date.now() - 30_000).toISOString(); // last 30 seconds
 
-  // DATA SUBSCRIPTIONS
-  useEffect(() => {
-      // Cache Courses
-      const unsubCourses = onSnapshot(collection(db, "courses"), (snapshot) => {
-          const map = new Map();
-          snapshot.docs.forEach(doc => map.set(doc.id, { id: doc.id, ...doc.data() }));
-          setCoursesCache(map);
-          console.log(`📦 Cached ${snapshot.size} courses`);
-      });
+    const q = query(
+      collection(db, "deviceEvents"),
+      where("deviceId", "==", DEVICE_ID),
+      where("processed", "==", false),
+      orderBy("createdAt", "desc"),
+      limit(20)
+    );
 
-      // Cache Active Sessions
-      const qSessions = query(collection(db, "sessions"), where("active", "==", true));
-      const unsubSessions = onSnapshot(qSessions, (snapshot) => {
-          const sessions = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-          setActiveSessionsCache(sessions);
-          console.log(`📦 Cached ${snapshot.size} active sessions`);
-      });
+    const unsubscribe = onSnapshot(q, async (snapshot) => {
+      for (const change of snapshot.docChanges()) {
+        if (change.type !== "added" && change.type !== "modified") continue;
 
-      return () => {
-          unsubCourses();
-          unsubSessions();
-      };
+        const eventDoc = change.doc;
+        const event = { id: eventDoc.id, ...eventDoc.data() } as any;
+
+        // Skip already-processed or stale events
+        if (processedIds.current.has(event.id)) continue;
+        if (event.createdAt < cutoff && change.type === "added") continue;
+
+        processedIds.current.add(event.id);
+
+        const p = event.payload ?? {};
+
+        switch (event.eventType) {
+          case "ATTENDANCE_RECORDED":
+            addToast({
+              id: event.id,
+              type: "entry",
+              title: "✅ Signed In",
+              message: `${p.studentName} — ${p.courseName}`,
+            });
+            break;
+
+          case "SIGNED_OUT":
+            addToast({
+              id: event.id,
+              type: "exit",
+              title: "👋 Signed Out",
+              message: `${p.studentName} — ${p.courseName}`,
+            });
+            break;
+
+          case "NO_ACTIVE_SESSION":
+            addToast({
+              id: event.id,
+              type: "warning",
+              title: "No Active Session",
+              message: p.message ?? "No sessions currently open",
+            });
+            break;
+
+          case "NO_MATCHING_SESSION":
+            addToast({
+              id: event.id,
+              type: "warning",
+              title: "Wrong Session",
+              message: `${p.studentName}: No session for ${p.department}`,
+            });
+            break;
+
+          case "SESSION_COMPLETED":
+            addToast({
+              id: event.id,
+              type: "info",
+              title: "Session Closed",
+              message: p.message ?? "Already signed out",
+            });
+            break;
+
+          case "DUPLICATE_ATTENDANCE":
+            addToast({
+              id: event.id,
+              type: "info",
+              title: "Already Marked",
+              message: p.message ?? "Attendance already recorded",
+            });
+            break;
+
+          default:
+            break;
+        }
+
+        // Mark event as processed so other listeners don't re-show it
+        try {
+          await updateDoc(doc(db, "deviceEvents", event.id), { processed: true });
+        } catch {
+          // Non-critical — ignore
+        }
+      }
+    });
+
+    return () => unsubscribe();
   }, []);
 
-  useEffect(() => {
-    // Connect to the bridge server
-    ws.current = new WebSocket("ws://localhost:5000");
+  function addToast(toast: AttendanceToast) {
+    setToasts((prev) => [toast, ...prev].slice(0, 5));
+    // Auto-dismiss after 6 seconds
+    setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== toast.id));
+    }, 6000);
+  }
 
-    ws.current.onopen = () => {
-      console.log("Global Listener connected to bridge.");
-    };
+  if (toasts.length === 0) return null;
 
-    ws.current.onmessage = async (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        
-        if (message.type === "ESP32_STATUS") {
-           // Cache the latest GPS coordinates
-           if (message.data && message.data.type === "STATUS") {
-               if (message.data.lat && message.data.lon) {
-                   lastKnownGPS.current = {
-                       latitude: message.data.lat,
-                       longitude: message.data.lon
-                   };
-               }
-           }
-        } else if (message.type === "VERIFY_RESPONSE" && message.success) {
-           // Handle fingerprint verification
-           const verificationId = message.id?.toString();
-           const now = Date.now();
-           const timeSinceLastProcess = now - lastProcessedVerification.current.timestamp;
-           
-           const isDuplicate = 
-             lastProcessedVerification.current.id === verificationId && 
-             timeSinceLastProcess < 5000;
-           
-           if (!isDuplicate) {
-             lastProcessedVerification.current = {
-               id: verificationId,
-               timestamp: now
-             };
-             
-             const lat = message.latitude || message.lat || lastKnownGPS.current.latitude;
-             const lon = message.longitude || message.lon || lastKnownGPS.current.longitude;
-
-             await handleAttendance({
-               id: message.id,
-               latitude: lat,
-               longitude: lon 
-             });
-           } else {
-             console.log(`⚠️ Skipping duplicate verification for ID ${verificationId}`);
-           }
-        }
-      } catch (e) {
-        // Ignore non-JSON
-      }
-    };
-
-    ws.current.onclose = () => {
-      // Reconnect handled by user refresh or simple timeout
-    };
-
-    return () => {
-      if (ws.current) ws.current.close();
-    };
-  }, []);
-
-  const handleAttendance = async (data: any) => {
-    const { id: fingerprintId, latitude: payloadLat, longitude: payloadLon } = data;
-    const latitude = payloadLat || lastKnownGPS.current.latitude;
-    const longitude = payloadLon || lastKnownGPS.current.longitude;
-
-    // 1. Find student (Try to optimize this later if needed, for now query is necessary)
-      const studentsRef = collection(db, "students");
-      const q = query(
-        studentsRef,
-        where("fingerprintTemplate", "==", fingerprintId.toString())
-      );
-      // This is the only critical network read now
-      const studentSnapshot = await getDocs(q);
-
-      if (studentSnapshot.empty) {
-        console.warn(`⚠️ Unknown fingerprint ID: ${fingerprintId}`);
-        return;
-      }
-
-      const studentDoc = studentSnapshot.docs[0];
-      const studentData = studentDoc.data();
-      const studentId = studentDoc.id;
-
-      // 2. Find matching active session from CACHE (Instant)
-      // Use refs to access latest data without dependency execution
-      const activeSessions = sessionsRef.current;
-      const coursesMap = coursesRef.current;
-
-      if (activeSessions.length === 0) {
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          ws.current.send(JSON.stringify({
-            type: "NO_ACTIVE_SESSION",
-            studentName: studentData.name,
-            message: "No active sessions available"
-          }));
-        }
-        return;
-      }
-
-      let matchedSession = null;
-      let matchedCourseId = null;
-
-      for (const sData of activeSessions) {
-          const cData = coursesMap.get(sData.courseId);
-          if (cData && cData.department === studentData.department && cData.level === studentData.level) {
-              matchedSession = sData;
-              matchedCourseId = sData.courseId;
-              break;
-          }
-      }
-
-      if (!matchedSession) {
-           if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-             ws.current.send(JSON.stringify({
-               type: "NO_MATCHING_SESSION",
-               studentName: studentData.name,
-               department: studentData.department,
-               level: studentData.level,
-               message: "No active session for your department and level"
-             }));
-           }
-           return;
-      }
-
-      const sessionId = matchedSession.id;
-      const courseId = matchedCourseId;
-
-      // 4. Memory Lock to prevent race conditions
-      const lockKey = `${studentId}-${sessionId}`;
-      if (globalPendingAttendance.has(lockKey)) {
-           console.warn(`🔒 Blocked duplicate processing for ${studentData.name} (Global Locked)`);
-           // Optional: Send feedback if needed
-           if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-             ws.current.send(JSON.stringify({
-               type: "DUPLICATE_ATTENDANCE",
-               studentName: studentData.name,
-               message: "Processing previous request..."
-             }));
-           }
-           return;
-      }
-      globalPendingAttendance.add(lockKey);
-
-      try {
-      // 3. Mark attendance
-      // Check for EXISTING status (Network Read 2 - Necessary for Toggle)
-      const attendanceRef = collection(db, "attendance");
-      const attendanceQuery = query(
-        attendanceRef,
-        where("studentId", "==", studentId),
-        where("sessionId", "==", sessionId)
-      );
-      const existingAttendance = await getDocs(attendanceQuery);
-
-      // --- CRITICAL PATH OPTIMIZATION ---
-      // Decide IN or OUT and broadast UI IMMEDIATELY
-      // Do not wait for Geocoding or DB Write
-
-      if (!existingAttendance.empty) {
-        const attendanceDoc = existingAttendance.docs[0];
-        const attendanceData = attendanceDoc.data();
-
-        if (attendanceData.signOutTime) {
-             if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-                ws.current.send(JSON.stringify({
-                    type: "SESSION_COMPLETED",
-                    studentName: studentData.name,
-                    message: "Session already completed"
-                }));
-             }
-             return;
-        }
-
-        // --- OPTIMISTIC UI BROADCAST: SIGN OUT ---
-        if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-            ws.current.send(JSON.stringify({
-                type: "SIGNED_OUT",
-                studentName: studentData.name,
-                studentId: studentData.studentId,
-                department: studentData.department,
-                courseName: coursesMap.get(courseId)?.name || "Unknown Course",
-                attendancePercentage: 0, 
-                message: "Signed Out Successfully"
-            }));
-        }
-
-        // Background Write: Sign Out
-        console.log(`ℹ️ Signing out ${studentData.name} (Background)`);
-        updateDoc(attendanceDoc.ref, {
-            signOutTime: Timestamp.now()
-        })
-        .then(() => globalPendingAttendance.delete(lockKey))
-        .catch(err => {
-            console.error("❌ SignOut Write Failed:", err);
-            globalPendingAttendance.delete(lockKey);
-        });
-        
-        return;
-      }
-
-      // --- OPTIMISTIC UI BROADCAST: SIGN IN ---
-      // Calculate weak percentage or just verify
-      const courseName = coursesMap.get(courseId)?.name || "Unknown Course";
-      
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-          ws.current.send(JSON.stringify({
-              type: "ATTENDANCE",
-              studentName: studentData.name,
-              studentId: studentData.studentId,
-              department: studentData.department,
-              courseName: courseName,
-              attendancePercentage: 0, // Placeholder to be fast
-              message: "Signed In Successfully"
-          }));
-      }
-
-      // Background Write: Sign In
-      // This happens AFTER UI is already entered
-      (async () => {
-          const locationName = latitude && longitude 
-            ? await reverseGeocode(latitude, longitude)
-            : 'No GPS';
-
-          await addDoc(attendanceRef, {
-            studentId,
-            courseId,
-            sessionId,
-            joinTime: Timestamp.now(),
-            verified: true,
-            verificationMethod: "fingerprint",
-            latitude: latitude || null,
-            longitude: longitude || null,
-            locationName: locationName,
-          });
-
-          console.log(`✅ Attendance Logged: ${studentData.name} | 📍 ${locationName}`);
-      })()
-      .then(() => globalPendingAttendance.delete(lockKey))
-      .catch(err => {
-          console.error("❌ Attendance Write Failed:", err);
-          globalPendingAttendance.delete(lockKey);
-      });
-
-
-    } catch (error) {
-      console.error("❌ Attendance error:", error);
-      globalPendingAttendance.delete(lockKey);
-    }
-  };
-
-  return null;
+  return (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
+      {toasts.map((toast) => (
+        <div
+          key={toast.id}
+          className={`px-4 py-3 rounded-lg shadow-lg text-white text-sm max-w-xs pointer-events-auto transition-all duration-300 ${
+            toast.type === "entry"
+              ? "bg-green-600"
+              : toast.type === "exit"
+              ? "bg-blue-600"
+              : toast.type === "warning"
+              ? "bg-yellow-600"
+              : toast.type === "error"
+              ? "bg-red-600"
+              : "bg-gray-700"
+          }`}
+        >
+          <div className="font-semibold">{toast.title}</div>
+          <div className="opacity-90">{toast.message}</div>
+        </div>
+      ))}
+    </div>
+  );
 }

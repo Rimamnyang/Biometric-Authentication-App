@@ -1,4 +1,8 @@
-import React, { useState, useEffect } from "react";
+// StudentManagement.tsx
+// Replaces three WebSocket usages (single delete, bulk delete, clear-all)
+// with calls to /api/device/command and Firestore onSnapshot for results.
+
+import React, { useState, useEffect, useRef } from "react";
 import {
   collection,
   onSnapshot,
@@ -6,6 +10,8 @@ import {
   updateDoc,
   deleteDoc,
   doc,
+  query,
+  where,
 } from "firebase/firestore";
 import { db } from "../services/firebase";
 import { Student } from "../types";
@@ -13,52 +19,43 @@ import StudentModal from "./StudentModal";
 import Spinner from "./Spinner";
 import Toast from "./Toast";
 import ConfirmModal from "./ConfirmModal";
+import { deleteFingerprint, clearAllFingerprints } from "../services/deviceApi";
 
 export default function StudentManagement() {
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingStudent, setEditingStudent] = useState<Student | null>(null);
-  const [deletingStudentId, setDeletingStudentId] = useState<string | null>(
-    null
-  );
+  const [deletingStudentId, setDeletingStudentId] = useState<string | null>(null);
   const [isDeletingAll, setIsDeletingAll] = useState(false);
   const [deleteAllProgress, setDeleteAllProgress] = useState({ current: 0, total: 0 });
   const [isClearingFingerprints, setIsClearingFingerprints] = useState(false);
-  const [toast, setToast] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
+  const [toast, setToast] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
   const [confirmModal, setConfirmModal] = useState<{
     isOpen: boolean;
     title: string;
     message: string;
-    variant: 'danger' | 'warning' | 'info';
+    variant: "danger" | "warning" | "info";
     onConfirm: () => void;
-  }>({ isOpen: false, title: '', message: '', variant: 'warning', onConfirm: () => {} });
+  }>({ isOpen: false, title: "", message: "", variant: "warning", onConfirm: () => {} });
 
+  const processedEventIds = useRef<Set<string>>(new Set());
+
+  // ── Load students ────────────────────────────────────────────────────────
   useEffect(() => {
     setLoading(true);
     const unsubscribe = onSnapshot(
       collection(db, "students"),
       (snapshot) => {
-        const studentsData = snapshot.docs.map(
-          (doc) =>
-            ({
-              id: doc.id,
-              ...doc.data(),
-            } as Student)
-        );
-        setStudents(studentsData);
+        setStudents(snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Student)));
         setLoading(false);
       },
-      (error) => {
-        console.error("Error fetching students:", error);
-        setLoading(false);
-      }
+      () => setLoading(false)
     );
-
     return () => unsubscribe();
   }, []);
 
-  // Auto-dismiss toast after 5 seconds
+  // Auto-dismiss toast
   useEffect(() => {
     if (toast) {
       const timer = setTimeout(() => setToast(null), 5000);
@@ -66,6 +63,7 @@ export default function StudentManagement() {
     }
   }, [toast]);
 
+  // ── CRUD helpers ─────────────────────────────────────────────────────────
   const handleOpenModal = (student: Student | null = null) => {
     setEditingStudent(student);
     setIsModalOpen(true);
@@ -79,8 +77,7 @@ export default function StudentManagement() {
   const handleFormSubmit = async (studentData: Omit<Student, "id">) => {
     try {
       if (editingStudent) {
-        const studentDoc = doc(db, "students", editingStudent.id);
-        await updateDoc(studentDoc, studentData);
+        await updateDoc(doc(db, "students", editingStudent.id), studentData);
       } else {
         await addDoc(collection(db, "students"), studentData);
       }
@@ -90,307 +87,260 @@ export default function StudentManagement() {
     }
   };
 
+  // ── Delete single student ────────────────────────────────────────────────
   const handleDeleteStudent = async (id: string) => {
     const studentToDelete = students.find((s) => s.id === id);
-    if (!studentToDelete) {
-      console.error("Student not found for deletion.");
-      return;
-    }
+    if (!studentToDelete) return;
 
-    // Case 1: No fingerprint registered, just delete from DB
+    // No fingerprint — just delete from DB
     if (!studentToDelete.fingerprintTemplate) {
       setConfirmModal({
         isOpen: true,
-        title: 'Delete Student',
-        message: 'This student has no fingerprint registered. Are you sure you want to delete them from the database?',
-        variant: 'danger',
+        title: "Delete Student",
+        message: "This student has no fingerprint registered. Delete from database?",
+        variant: "danger",
         onConfirm: async () => {
-          setConfirmModal({ ...confirmModal, isOpen: false });
+          setConfirmModal((prev) => ({ ...prev, isOpen: false }));
           try {
             setDeletingStudentId(id);
             await deleteDoc(doc(db, "students", id));
-            setToast({ type: 'success', message: 'Student deleted successfully!' });
-          } catch (error) {
-            console.error("Error deleting student from Firestore:", error);
-            setToast({ type: 'error', message: 'Error deleting student from database.' });
+            setToast({ type: "success", message: "Student deleted successfully!" });
+          } catch {
+            setToast({ type: "error", message: "Error deleting student from database." });
           } finally {
             setDeletingStudentId(null);
           }
-        }
+        },
       });
       return;
     }
 
-    // Case 2: Fingerprint exists, confirm deletion from module and DB
+    // Has fingerprint — delete from hardware then DB
     setConfirmModal({
       isOpen: true,
-      title: 'Delete Student',
-      message: 'Are you sure you want to delete this student? This will also remove their fingerprint from the scanner module.',
-      variant: 'danger',
-      onConfirm: () => {
-        setConfirmModal({ ...confirmModal, isOpen: false });
-      setDeletingStudentId(id);
+      title: "Delete Student",
+      message:
+        "Are you sure? This will also remove their fingerprint from the scanner module.",
+      variant: "danger",
+      onConfirm: async () => {
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+        setDeletingStudentId(id);
 
-      const ws = new WebSocket("ws://localhost:5000");
+        const result = await deleteFingerprint(studentToDelete.fingerprintTemplate);
+        if (!result.success) {
+          setToast({ type: "error", message: "Could not reach device. Please try again." });
+          setDeletingStudentId(null);
+          return;
+        }
 
-      ws.onopen = () => {
-        console.log("Connected to fingerprint bridge for deletion.");
-        ws.send(`DELETE_FINGERPRINT:${studentToDelete.fingerprintTemplate}`);
-      };
+        // Listen for DELETE_RESPONSE then clean up DB
+        const cutoff = new Date(Date.now() - 5_000).toISOString();
+        const q = query(
+          collection(db, "deviceEvents"),
+          where("eventType", "==", "DELETE_RESPONSE"),
+          where("processed", "==", false)
+        );
 
-      ws.onmessage = async (event) => {
-        try {
-          const response = JSON.parse(event.data);
-          
-          if (response.type === "DELETE_RESPONSE") {
-             if (response.success) {
-                try {
-                  await deleteDoc(doc(db, "students", id));
-                  setToast({ type: 'success', message: 'Student and fingerprint deleted successfully!' });
-                } catch (error) {
-                  console.error("Firestore delete error:", error);
-                  setToast({ type: 'error', message: 'Fingerprint deleted, but database cleanup failed.' });
-                }
-             } else {
-               setToast({ type: 'error', message: `Failed to delete fingerprint: ${response.error || "Unknown error"}` });
-             }
-             ws.close();
+        let timeout: ReturnType<typeof setTimeout>;
+        const unsub = onSnapshot(q, async (snap) => {
+          for (const change of snap.docChanges()) {
+            if (change.type !== "added" && change.type !== "modified") continue;
+            const ev = { id: change.doc.id, ...change.doc.data() } as any;
+            if (processedEventIds.current.has(ev.id)) continue;
+            if (ev.createdAt < cutoff) continue;
+            processedEventIds.current.add(ev.id);
+
+            clearTimeout(timeout);
+            unsub();
+
+            const p = ev.payload ?? {};
+            if (p.success) {
+              try {
+                await deleteDoc(doc(db, "students", id));
+                setToast({ type: "success", message: "Student and fingerprint deleted!" });
+              } catch {
+                setToast({ type: "error", message: "Fingerprint deleted but DB cleanup failed." });
+              }
+            } else {
+              setToast({ type: "error", message: `Delete failed: ${p.error ?? "Unknown error"}` });
+            }
+
+            try { await updateDoc(doc(db, "deviceEvents", ev.id), { processed: true }); } catch {}
+            setDeletingStudentId(null);
           }
-        } catch (e) {
-          console.log("Ignored non-JSON message during delete");
-        }
-      };
-
-      ws.onerror = (error) => {
-        console.error("WebSocket Error:", error);
-        setToast({
-          type: 'error',
-          message: 'Could not connect to the fingerprint bridge. Please ensure it is running.'
         });
-        setDeletingStudentId(null);
-        if (
-          ws.readyState === WebSocket.OPEN ||
-          ws.readyState === WebSocket.CONNECTING
-        ) {
-          ws.close();
-        }
-      };
 
-      ws.onclose = () => {
-        console.log("Disconnected from fingerprint bridge.");
-        setDeletingStudentId(null);
-      };
-    }
+        // Timeout after 15s
+        timeout = setTimeout(() => {
+          unsub();
+          setToast({ type: "error", message: "Timeout waiting for device response." });
+          setDeletingStudentId(null);
+        }, 15_000);
+      },
     });
   };
 
+  // ── Bulk delete ──────────────────────────────────────────────────────────
   const handleDeleteAll = async () => {
     if (students.length === 0) {
-      setToast({ type: 'info', message: 'No students to delete.' });
+      setToast({ type: "info", message: "No students to delete." });
       return;
     }
-
     setConfirmModal({
       isOpen: true,
-      title: 'Delete All Students',
-      message: `Are you sure you want to delete ALL ${students.length} students? This will:\n\n` +
-        `1. Delete all fingerprint templates from the scanner module\n` +
-        `2. Remove all students from the database\n\n` +
-        `This action CANNOT be undone!`,
-      variant: 'danger',
+      title: "Delete All Students",
+      message:
+        `Are you sure you want to delete ALL ${students.length} students?\n\n` +
+        "1. Delete all fingerprint templates from the scanner\n" +
+        "2. Remove all students from the database\n\n" +
+        "This action CANNOT be undone!",
+      variant: "danger",
       onConfirm: () => {
-        setConfirmModal({ ...confirmModal, isOpen: false });
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
         performBulkDelete();
-      }
+      },
     });
   };
 
   const performBulkDelete = async () => {
-
     setIsDeletingAll(true);
-    setDeleteAllProgress({ current: 0, total: students.length });
-
-    const ws = new WebSocket("ws://localhost:5000");
-    let currentIndex = 0;
     const studentsToDelete = [...students];
-    const deletionResults: { success: number; failed: number } = { success: 0, failed: 0 };
+    setDeleteAllProgress({ current: 0, total: studentsToDelete.length });
+    let success = 0;
+    let failed = 0;
 
-    ws.onopen = () => {
-      console.log("Connected to bridge for bulk deletion.");
-      processNextStudent();
-    };
+    for (let i = 0; i < studentsToDelete.length; i++) {
+      const student = studentsToDelete[i];
+      setDeleteAllProgress({ current: i + 1, total: studentsToDelete.length });
 
-    const processNextStudent = async () => {
-      if (currentIndex >= studentsToDelete.length) {
-        // All done
-        ws.close();
-        setIsDeletingAll(false);
-        setToast({
-          type: deletionResults.failed === 0 ? 'success' : 'info',
-          message: `Deletion complete! ✅ ${deletionResults.success} deleted, ❌ ${deletionResults.failed} failed`
-        });
-        return;
-      }
-
-      const student = studentsToDelete[currentIndex];
-      setDeleteAllProgress({ current: currentIndex + 1, total: studentsToDelete.length });
-
-      // If no fingerprint, just delete from DB
       if (!student.fingerprintTemplate) {
         try {
           await deleteDoc(doc(db, "students", student.id));
-          deletionResults.success++;
-          console.log(`✅ Deleted student (no fingerprint): ${student.name}`);
-        } catch (error) {
-          console.error(`❌ Failed to delete ${student.name}:`, error);
-          deletionResults.failed++;
+          success++;
+        } catch {
+          failed++;
         }
-        currentIndex++;
-        processNextStudent();
-        return;
+        continue;
       }
 
-      // Has fingerprint - send delete command to hardware
-      console.log(`Deleting fingerprint ${student.fingerprintTemplate} for ${student.name}...`);
-      ws.send(`DELETE_FINGERPRINT:${student.fingerprintTemplate}`);
-    };
+      // Send delete command and wait for event (with timeout)
+      const cmdResult = await deleteFingerprint(student.fingerprintTemplate);
+      if (!cmdResult.success) {
+        failed++;
+        continue;
+      }
 
-    ws.onmessage = async (event) => {
-      try {
-        const response = JSON.parse(event.data);
-        
-        if (response.type === "DELETE_RESPONSE") {
-          const student = studentsToDelete[currentIndex];
-          
-          if (response.success) {
-            // Delete from database after hardware confirms
-            try {
-              await deleteDoc(doc(db, "students", student.id));
-              deletionResults.success++;
-              console.log(`✅ Deleted: ${student.name}`);
-            } catch (error) {
-              console.error(`❌ Hardware deleted but DB failed for ${student.name}:`, error);
-              deletionResults.failed++;
-            }
-          } else {
-            console.error(`❌ Hardware delete failed for ${student.name}`);
-            deletionResults.failed++;
-          }
-          
-          currentIndex++;
-          // Process next immediately for faster deletion
-          processNextStudent();
+      const deleteOk = await waitForDeleteResponse(5);
+      if (deleteOk) {
+        try {
+          await deleteDoc(doc(db, "students", student.id));
+          success++;
+        } catch {
+          failed++;
         }
-      } catch (e) {
-        console.log("Non-JSON message during bulk delete");
+      } else {
+        failed++;
       }
-    };
+    }
 
-    ws.onerror = (error) => {
-      console.error("WebSocket error during bulk delete:", error);
-      setToast({
-        type: 'error',
-        message: `Connection error after deleting ${deletionResults.success} students. Please check the bridge.`
-      });
-      setIsDeletingAll(false);
-      ws.close();
-    };
-
-    ws.onclose = () => {
-      console.log("Bulk deletion connection closed.");
-      setIsDeletingAll(false);
-    };
-  };
-
-  const handleClearAllFingerprints = () => {
-    setConfirmModal({
-      isOpen: true,
-      title: 'Clear All Fingerprints',
-      message: 'Are you sure you want to clear ALL fingerprints from the sensor module?\n\n' +
-        'This will:\n' +
-        '1. Erase all fingerprint templates from the hardware\n' +
-        '2. Students will need to re-enroll their fingerprints\n\n' +
-        'This action CANNOT be undone!',
-      variant: 'danger',
-      onConfirm: () => {
-        setConfirmModal({ ...confirmModal, isOpen: false });
-        performClearAllFingerprints();
-      }
+    setIsDeletingAll(false);
+    setToast({
+      type: failed === 0 ? "success" : "info",
+      message: `Done! ✅ ${success} deleted, ❌ ${failed} failed`,
     });
   };
 
-  const performClearAllFingerprints = () => {
-    setIsClearingFingerprints(true);
-
-    const ws = new WebSocket("ws://localhost:5000");
-    let responseReceived = false;
-
-    ws.onopen = () => {
-      console.log("Connected to bridge for clearing fingerprints.");
-      ws.send("CLEAR_ALL_FINGERPRINTS");
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const response = JSON.parse(event.data);
-        
-        if (response.type === "CLEAR_ALL_RESPONSE") {
-          responseReceived = true;
-          
-          if (response.success) {
-            setToast({
-              type: 'success',
-              message: 'All fingerprints cleared from sensor module!'
-            });
-            console.log("✅ All fingerprints cleared from hardware");
-          } else {
-            setToast({
-              type: 'error',
-              message: `Failed to clear fingerprints: ${response.error || 'Unknown error'}`
-            });
-            console.error("❌ Clear all failed:", response.error);
-          }
-          
-          ws.close();
-          setIsClearingFingerprints(false);
+  /** Waits up to `timeoutSec` for a DELETE_RESPONSE deviceEvent */
+  const waitForDeleteResponse = (timeoutSec: number): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const cutoff = new Date(Date.now() - 2_000).toISOString();
+      const q = query(
+        collection(db, "deviceEvents"),
+        where("eventType", "==", "DELETE_RESPONSE"),
+        where("processed", "==", false)
+      );
+      const timeout = setTimeout(() => { unsub(); resolve(false); }, timeoutSec * 1000);
+      const unsub = onSnapshot(q, async (snap) => {
+        for (const change of snap.docChanges()) {
+          if (change.type !== "added" && change.type !== "modified") continue;
+          const ev = { id: change.doc.id, ...change.doc.data() } as any;
+          if (processedEventIds.current.has(ev.id)) continue;
+          if (ev.createdAt < cutoff) continue;
+          processedEventIds.current.add(ev.id);
+          clearTimeout(timeout);
+          unsub();
+          try { await updateDoc(doc(db, "deviceEvents", ev.id), { processed: true }); } catch {}
+          resolve((ev.payload ?? {}).success === true);
+          return;
         }
-      } catch (e) {
-        console.log("Non-JSON message:", event.data);
-      }
-    };
-
-    ws.onerror = (error) => {
-      console.error("WebSocket error:", error);
-      setToast({
-        type: 'error',
-        message: 'Could not connect to fingerprint bridge. Please ensure it is running.'
       });
+    });
+  };
+
+  // ── Clear all fingerprints ────────────────────────────────────────────────
+  const handleClearAllFingerprints = () => {
+    setConfirmModal({
+      isOpen: true,
+      title: "Clear All Fingerprints",
+      message:
+        "Are you sure you want to clear ALL fingerprints from the sensor module?\n\n" +
+        "1. Erase all fingerprint templates from the hardware\n" +
+        "2. Students will need to re-enroll their fingerprints\n\n" +
+        "This action CANNOT be undone!",
+      variant: "danger",
+      onConfirm: () => {
+        setConfirmModal((prev) => ({ ...prev, isOpen: false }));
+        performClearAllFingerprints();
+      },
+    });
+  };
+
+  const performClearAllFingerprints = async () => {
+    setIsClearingFingerprints(true);
+    const result = await clearAllFingerprints();
+
+    if (!result.success) {
+      setToast({ type: "error", message: "Could not reach device. Please try again." });
       setIsClearingFingerprints(false);
-      ws.close();
-    };
+      return;
+    }
 
-    ws.onclose = () => {
-      if (!responseReceived) {
-        setToast({
-          type: 'error',
-          message: 'Connection closed before receiving response.'
-        });
+    // Wait for CLEAR_ALL_RESPONSE event
+    const cutoff = new Date(Date.now() - 3_000).toISOString();
+    const q = query(
+      collection(db, "deviceEvents"),
+      where("eventType", "==", "CLEAR_ALL_RESPONSE"),
+      where("processed", "==", false)
+    );
+
+    let timeout: ReturnType<typeof setTimeout>;
+    const unsub = onSnapshot(q, async (snap) => {
+      for (const change of snap.docChanges()) {
+        if (change.type !== "added" && change.type !== "modified") continue;
+        const ev = { id: change.doc.id, ...change.doc.data() } as any;
+        if (processedEventIds.current.has(ev.id)) continue;
+        if (ev.createdAt < cutoff) continue;
+        processedEventIds.current.add(ev.id);
+
+        clearTimeout(timeout);
+        unsub();
+
+        const p = ev.payload ?? {};
+        setToast(
+          p.success
+            ? { type: "success", message: "All fingerprints cleared from sensor module!" }
+            : { type: "error", message: `Failed: ${p.error ?? "Unknown error"}` }
+        );
+        try { await updateDoc(doc(db, "deviceEvents", ev.id), { processed: true }); } catch {}
         setIsClearingFingerprints(false);
       }
-      console.log("Clear all fingerprints connection closed.");
-    };
+    });
 
-    // Timeout after 10 seconds
-    setTimeout(() => {
-      if (!responseReceived && ws.readyState === WebSocket.OPEN) {
-        ws.close();
-        setToast({
-          type: 'error',
-          message: 'Operation timed out. Please try again.'
-        });
-        setIsClearingFingerprints(false);
-      }
-    }, 10000);
+    timeout = setTimeout(() => {
+      unsub();
+      setToast({ type: "error", message: "Timeout waiting for device response." });
+      setIsClearingFingerprints(false);
+    }, 15_000);
   };
 
   if (loading) {
@@ -414,14 +364,12 @@ export default function StudentManagement() {
             {isClearingFingerprints ? (
               <>
                 <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                 </svg>
                 Clearing...
               </>
-            ) : (
-              "Clear All Fingerprints"
-            )}
+            ) : "Clear All Fingerprints"}
           </button>
           <button
             onClick={handleDeleteAll}
@@ -431,14 +379,12 @@ export default function StudentManagement() {
             {isDeletingAll ? (
               <>
                 <svg className="animate-spin h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                 </svg>
                 Deleting {deleteAllProgress.current}/{deleteAllProgress.total}
               </>
-            ) : (
-              "Delete All Students"
-            )}
+            ) : "Delete All Students"}
           </button>
           <button
             onClick={() => handleOpenModal()}
@@ -453,78 +399,36 @@ export default function StudentManagement() {
         <table className="min-w-full divide-y divide-gray-200">
           <thead className="bg-gray-50">
             <tr>
-              <th
-                scope="col"
-                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-              >
-                Name
-              </th>
-              <th
-                scope="col"
-                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-              >
-                Student ID
-              </th>
-              <th
-                scope="col"
-                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-              >
-                Department
-              </th>
-              <th
-                scope="col"
-                className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-              >
-                Level
-              </th>
-              <th scope="col" className="relative px-6 py-3">
-                <span className="sr-only">Actions</span>
-              </th>
+              {["Name", "Student ID", "Department", "Level", ""].map((h) => (
+                <th key={h} scope="col" className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  {h}
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody className="bg-white divide-y divide-gray-200">
             {students.length > 0 ? (
               students.map((student) => (
                 <tr key={student.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                    {student.name}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {student.studentId}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {student.department}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {student.level}
-                  </td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{student.name}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{student.studentId}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{student.department}</td>
+                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{student.level}</td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-4">
-                    <button
-                      onClick={() => handleOpenModal(student)}
-                      className="text-indigo-600 hover:text-indigo-900"
-                    >
-                      Edit
-                    </button>
+                    <button onClick={() => handleOpenModal(student)} className="text-indigo-600 hover:text-indigo-900">Edit</button>
                     <button
                       onClick={() => handleDeleteStudent(student.id)}
                       disabled={deletingStudentId === student.id}
                       className="text-red-600 hover:text-red-900 disabled:text-gray-400 disabled:cursor-wait"
                     >
-                      {deletingStudentId === student.id
-                        ? "Deleting..."
-                        : "Delete"}
+                      {deletingStudentId === student.id ? "Deleting..." : "Delete"}
                     </button>
                   </td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td
-                  colSpan={5}
-                  className="px-6 py-4 text-center text-sm text-gray-500"
-                >
-                  No students found.
-                </td>
+                <td colSpan={5} className="px-6 py-4 text-center text-sm text-gray-500">No students found.</td>
               </tr>
             )}
           </tbody>
@@ -540,13 +444,7 @@ export default function StudentManagement() {
         />
       )}
 
-      {toast && (
-        <Toast
-          type={toast.type}
-          message={toast.message}
-          onClose={() => setToast(null)}
-        />
-      )}
+      {toast && <Toast type={toast.type} message={toast.message} onClose={() => setToast(null)} />}
 
       <ConfirmModal
         isOpen={confirmModal.isOpen}
@@ -555,7 +453,7 @@ export default function StudentManagement() {
         variant={confirmModal.variant}
         confirmText="Delete"
         onConfirm={confirmModal.onConfirm}
-        onCancel={() => setConfirmModal({ ...confirmModal, isOpen: false })}
+        onCancel={() => setConfirmModal((prev) => ({ ...prev, isOpen: false }))}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-git commit -m "first commit"// Reverse geocoding utility using OpenStreetMap Nominatim API
+// Reverse geocoding utility using OpenStreetMap Nominatim API
 // Free, no API key required
 
 export async function reverseGeocode(lat: number, lon: number): Promise<string> {
